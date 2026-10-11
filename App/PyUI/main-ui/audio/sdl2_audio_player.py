@@ -4,10 +4,15 @@ import subprocess
 import sdl2
 import sdl2.sdlmixer as sdlmixer
 import threading
+import time
 import queue
 from typing import Optional
 from utils.logger import PyUiLogger
 from utils.time_logger import log_timing
+
+# Seconds of silence before the audio device is closed: an open device
+# streams silence and keeps SDL's ALSA hotplug thread polling.
+IDLE_CLOSE_SECONDS = 5.0
 
 # Commands for the worker
 class _Cmd:
@@ -208,7 +213,7 @@ class Sdl2AudioPlayer:
                 # check driver
                 driver = sdl2.SDL_GetCurrentAudioDriver()
                 if driver:
-                    PyUiLogger.get_logger().info(f"Audio driver (pre-init): {driver.decode()}")
+                    PyUiLogger.get_logger().debug(f"Audio driver (pre-init): {driver.decode()}")
                 else:
                     PyUiLogger.get_logger().warning("No SDL audio driver detected (pre-init).")
 
@@ -221,7 +226,7 @@ class Sdl2AudioPlayer:
                 for freq, buf in [(44100, 1024), (22050, 1024), (16000, 512)]:
                     try:
                         if sdlmixer.Mix_OpenAudio(freq, sdl2.AUDIO_S16SYS, 2, buf) == 0:
-                            PyUiLogger.get_logger().info(f"Mix_OpenAudio succeeded: {freq}@{buf}")
+                            PyUiLogger.get_logger().debug(f"Mix_OpenAudio succeeded: {freq}@{buf}")
                             opened = True
                             break
                         else:
@@ -229,6 +234,8 @@ class Sdl2AudioPlayer:
                     except Exception as e:
                         PyUiLogger.get_logger().warning(f"Mix_OpenAudio exception: {e}")
                 if not opened:
+                    # balance the InitSubSystem above, or the refcount pins the driver
+                    sdl2.SDL_QuitSubSystem(sdl2.SDL_INIT_AUDIO)
                     return False
                 sdlmixer.Mix_AllocateChannels(8)
                 # set the initial volume
@@ -267,15 +274,13 @@ class Sdl2AudioPlayer:
                 PyUiLogger.get_logger().warning(f"Mix_LoadMUS exception for {path}: {e}")
                 return None
 
-        def reinit_audio():
-            """Tear down and reinitialize SDL2 audio (e.g. after sleep/wake kills ALSA)."""
+        def close_audio():
+            """Free chunks and music and close the device; wanted_chunks survive for reopen."""
             nonlocal loop_channel, loop_music_path, loop_chunk_path
-            PyUiLogger.get_logger().warning("Reinitializing SDL2 audio after sleep/wake...")
             loop_channel = None
             loop_music_path = None
             loop_chunk_path = None
-            # Save paths so we can re-preload after reinit
-            old_chunk_paths = list(wanted_chunks | set(chunk_map.keys()))
+            wanted_chunks.update(chunk_map.keys())
             for p, cptr in list(chunk_map.items()):
                 try:
                     sdlmixer.Mix_FreeChunk(cptr)
@@ -297,16 +302,32 @@ class Sdl2AudioPlayer:
             except Exception:
                 pass
 
+        def open_audio():
             ok = worker_init()
+            if ok:
+                for p in list(wanted_chunks):
+                    safe_load_chunk(p)
+            return ok
 
+        def ensure_open():
+            return mixer_open() or open_audio()
+
+        def reinit_audio():
+            """Tear down and reinitialize SDL2 audio (e.g. after sleep/wake kills ALSA)."""
+            PyUiLogger.get_logger().warning("Reinitializing SDL2 audio after sleep/wake...")
+            close_audio()
+            ok = open_audio()
             if ok:
                 PyUiLogger.get_logger().info("SDL2 audio reinit succeeded.")
-                # Re-preload previously cached WAVs
-                for p in old_chunk_paths:
-                    safe_load_chunk(p)
             else:
                 PyUiLogger.get_logger().warning("SDL2 audio reinit failed.")
             return ok
+
+        def anything_playing():
+            try:
+                return sdlmixer.Mix_Playing(-1) > 0 or sdlmixer.Mix_PlayingMusic() != 0
+            except Exception:
+                return False
 
         def stop_loop_internal():
             nonlocal loop_channel, loop_music_path, loop_chunk_path
@@ -341,6 +362,7 @@ class Sdl2AudioPlayer:
         # post result to main via shared flags
         Sdl2AudioPlayer._initialized = init_ok
         Sdl2AudioPlayer._init_failed = not init_ok
+        last_sound = time.monotonic()
 
         # main worker loop
         while Sdl2AudioPlayer._running:
@@ -350,13 +372,26 @@ class Sdl2AudioPlayer:
                 # Check if device requested audio reinit (e.g. A30 after sleep/wake)
                 if os.path.exists("/tmp/audio_reinit_needed"):
                     os.remove("/tmp/audio_reinit_needed")
-                    reinit_audio()
+                    # a closed device picks up the new output on its next open
+                    if mixer_open():
+                        reinit_audio()
+                if mixer_open():
+                    if anything_playing():
+                        last_sound = time.monotonic()
+                    elif time.monotonic() - last_sound > IDLE_CLOSE_SECONDS:
+                        close_audio()
                 continue
 
             try:
                 name = cmd.name
-                if name not in ("init", "preload_wav", "cleanup") and not mixer_open():
-                    reply_ok(cmd.resp_q, False)
+                if name in ("play_wav_once", "start_loop_wav", "start_loop_music"):
+                    if not ensure_open():
+                        reply_ok(cmd.resp_q, False)
+                        continue
+                    last_sound = time.monotonic()
+                elif name in ("set_volume", "stop_loop") and not mixer_open():
+                    # volume is applied on open; nothing loops while closed
+                    reply_ok(cmd.resp_q, True)
                     continue
                 if name == "init":
                     reply_ok(cmd.resp_q, init_ok)
@@ -371,7 +406,8 @@ class Sdl2AudioPlayer:
                 elif name == "preload_wav":
                     path = cmd.args[0]
                     wanted_chunks.add(path)
-                    if path in chunk_map:
+                    # loaded on open: Mix_LoadWAV needs an open device
+                    if path in chunk_map or not mixer_open():
                         reply_ok(cmd.resp_q, True)
                         continue
                     try:
